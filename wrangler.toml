@@ -4,4 +4,4 @@ compatibility_date = "2026-09-16"
 
 # 新增下面这几行
 [assets]
-directory = "./"
+directory = "./public"
