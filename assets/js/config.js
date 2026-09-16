@@ -5,5 +5,5 @@
  * Everything else auto-updates on page load.
  */
 window.CF_PROXY = {
-  DOMAIN: 'cloudflare-proxy-6rw.pages.dev',
+  DOMAIN: 'docker.yuanzhangzcc.com',
 };
