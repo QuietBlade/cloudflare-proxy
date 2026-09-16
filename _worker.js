@@ -116,7 +116,7 @@ async function fetchDockerToken(wwwAuth) {
   // 1. 去除 "Bearer " 前缀（忽略大小写，兼容开头可能的空格）
   const paramString = wwwAuth.replace(/^Bearer\s+/i, '');
   
-  // 2. 动态提取所有的 key="value" 对，存入对象
+  // 2. 动态提取所有的 key="value" 对
   const params = {};
   const regex = /(\w+)="([^"]+)"/g;
   let match;
@@ -127,14 +127,20 @@ async function fetchDockerToken(wwwAuth) {
   // 3. 校验必须的最核心参数 realm
   if (!params.realm) return null;
 
-  // 4. 使用原生 URL 对象安全地构建带参数的请求
   try {
     const tokenUrl = new URL(params.realm);
     if (params.service) tokenUrl.searchParams.set('service', params.service);
     if (params.scope) tokenUrl.searchParams.set('scope', params.scope);
 
+    const fetchHeaders = { Accept: 'application/json' };
+    
+    // 4. 直接读取你在 fetch 阶段挂载的全局账号密码变量
+    if (globalThis.USER && globalThis.PASS) {
+      fetchHeaders.Authorization = 'Basic ' + btoa(`\({globalThis.USER}:\){globalThis.PASS}`);
+    }
+
     const res = await fetch(tokenUrl.toString(), { 
-      headers: { Accept: 'application/json' } 
+      headers: fetchHeaders 
     });
     
     if (!res.ok) return null;
@@ -266,6 +272,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname, search } = url;
+    globalThis.USER = env.DOCKER_USER;
+    globalThis.PASS = env.DOCKER_PASS;
 
     if (request.method === 'OPTIONS') return corsPreflight();
 
