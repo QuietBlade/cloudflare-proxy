@@ -113,18 +113,35 @@ function wrapResponse(upstream) {
 
 /** 解析 WWW-Authenticate 并拿 token */
 async function fetchDockerToken(wwwAuth) {
-  const m = wwwAuth.match(/Bearer realm="([^"]+?)",service="([^"]*?)",scope="([^"]*?)"/);
-  if (!m) return null;
+  // 1. 去除 "Bearer " 前缀（忽略大小写，兼容开头可能的空格）
+  const paramString = wwwAuth.replace(/^Bearer\s+/i, '');
+  
+  // 2. 动态提取所有的 key="value" 对，存入对象
+  const params = {};
+  const regex = /(\w+)="([^"]+)"/g;
+  let match;
+  while ((match = regex.exec(paramString)) !== null) {
+    params[match[1]] = match[2];
+  }
 
-  const [, realm, service, scope] = m;
-  const tokenUrl = `${realm}?service=${service}&scope=${encodeURIComponent(scope)}`;
+  // 3. 校验必须的最核心参数 realm
+  if (!params.realm) return null;
 
+  // 4. 使用原生 URL 对象安全地构建带参数的请求
   try {
-    const res = await fetch(tokenUrl, { headers: { Accept: 'application/json' } });
+    const tokenUrl = new URL(params.realm);
+    if (params.service) tokenUrl.searchParams.set('service', params.service);
+    if (params.scope) tokenUrl.searchParams.set('scope', params.scope);
+
+    const res = await fetch(tokenUrl.toString(), { 
+      headers: { Accept: 'application/json' } 
+    });
+    
     if (!res.ok) return null;
+    
     const data = await res.json();
     return data.token || data.access_token || null;
-  } catch {
+  } catch (err) {
     return null;
   }
 }
@@ -140,11 +157,12 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
 
   const headers = buildReqHeaders(request, targetUrl);
 
-  const upstream = await fetch(targetUrl, {
+  // 修改点：使用 let 声明，允许被重试的请求覆盖
+  let upstream = await fetch(targetUrl, {
     method: request.method,
     headers,
     body: request.body,
-    redirect: 'manual', // 关键：手动处理重定向
+    redirect: 'manual', 
   });
 
   // ===== Docker 401 → 拿 token 重试 =====
@@ -155,43 +173,38 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
       if (token) {
         const authHeaders = buildReqHeaders(request, targetUrl);
         authHeaders.set('Authorization', `Bearer ${token}`);
-        const retry = await fetch(targetUrl, {
+        // 修改点：不直接 return，而是覆盖 upstream，让其继续往下走
+        upstream = await fetch(targetUrl, {
           method: request.method,
           headers: authHeaders,
           body: request.body,
           redirect: 'manual',
         });
-        return retry;
+      } else {
+        // 修改点：如果拿不到 token（或解析失败），抹除 WWW-Authenticate，防止客户端直连被墙
+        const res = wrapResponse(upstream);
+        res.headers.delete('WWW-Authenticate');
+        return res;
       }
     }
-    // token 拿不到就原样返回 401
-    return wrapResponse(upstream);
   }
 
   // ===== S3 / CDN 重定向 → 重新代理 =====
+  // 修改点：此时的 upstream 可能是第一次的 307，也可能是获取 Token 重试后拿到的 307
   if (upstream.status === 302 || upstream.status === 307) {
     const location = upstream.headers.get('Location');
     if (location) {
       const redirHeaders = buildReqHeaders(request, location);
-      // 带回上游给的 Authorization（如果有的话）
       const upstreamAuth = upstream.headers.get('Authorization');
       if (upstreamAuth) redirHeaders.set('Authorization', upstreamAuth);
 
-      const redirResp = await fetch(location, {
+      // 修改点：直接递归调用 proxyWithAuth 自己，而不是单独写一套 fetch
+      // 注意：重定向到 S3 后，不再视为 Docker 鉴权 (isDocker = false)
+      return proxyWithAuth(location, new Request(location, {
         method: request.method,
         headers: redirHeaders,
-        body: request.body,
-        redirect: 'manual',
-      });
-
-      // 如果还是重定向，递归
-      if (redirResp.status === 302 || redirResp.status === 307) {
-        const nextLocation = redirResp.headers.get('Location');
-        if (nextLocation) {
-          return proxyWithAuth(nextLocation, request, isDocker, redirectCount + 1);
-        }
-      }
-      return wrapResponse(redirResp);
+        body: request.body
+      }), false, redirectCount + 1);
     }
   }
 
@@ -209,21 +222,35 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
  * 不做"单段 = library/xxx"的猜测，避免把 /gh、/docs 等静态页面路径误判为镜像名。
  */
 function parseDockerPath(pathname, search) {
+  // 核心修改：处理 /v2/ghcr.io/xxx 格式
   if (pathname.startsWith('/v2/')) {
+    const pathWithoutV2 = pathname.replace('/v2/', '');
+    const parts = pathWithoutV2.split('/');
+    
+    // 如果发现路径第一段是第三方 registry（比如 ghcr.io）
+    if (DOCKER_REGISTRIES.has(parts[0])) {
+      const host = parts[0];
+      const imagePath = parts.slice(1).join('/');
+      return {
+        targetUrl: `https://\({host}/v2/\){imagePath}${search || ''}`,
+        isDocker: true,
+      };
+    }
+    
+    // 否则默认发往 Docker Hub
     return {
       targetUrl: DOCKER_UPSTREAM + pathname + (search || ''),
       isDocker: true,
     };
   }
 
+  // 处理客户端非标请求格式 (直接请求 /ghcr.io/...)
   const parts = pathname.split('/').filter(Boolean);
-  if (parts.length === 0) return null;
-
-  if (DOCKER_REGISTRIES.has(parts[0])) {
+  if (parts.length > 0 && DOCKER_REGISTRIES.has(parts[0])) {
     const host = parts[0];
     const imagePath = parts.slice(1).join('/');
     return {
-      targetUrl: `https://${host}/v2/${imagePath}`,
+      targetUrl: `https://\({host}/v2/\){imagePath}${search || ''}`,
       isDocker: true,
     };
   }
