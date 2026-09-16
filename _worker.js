@@ -112,11 +112,8 @@ function wrapResponse(upstream) {
 // ============================================================
 
 /** 解析 WWW-Authenticate 并拿 token */
-async function fetchDockerToken(wwwAuth) {
-  // 1. 去除 "Bearer " 前缀（忽略大小写，兼容开头可能的空格）
+async function fetchDockerToken(wwwAuth, env) {
   const paramString = wwwAuth.replace(/^Bearer\s+/i, '');
-  
-  // 2. 动态提取所有的 key="value" 对
   const params = {};
   const regex = /(\w+)="([^"]+)"/g;
   let match;
@@ -124,25 +121,30 @@ async function fetchDockerToken(wwwAuth) {
     params[match[1]] = match[2];
   }
 
-  // 3. 校验必须的最核心参数 realm
   if (!params.realm) return null;
 
   try {
     const tokenUrl = new URL(params.realm);
     if (params.service) tokenUrl.searchParams.set('service', params.service);
     if (params.scope) tokenUrl.searchParams.set('scope', params.scope);
+    
+    // 增加 client_id，伪装成标准客户端，防止被官方拦截
+    tokenUrl.searchParams.set('client_id', 'cloudflare-docker-proxy');
 
     const fetchHeaders = { Accept: 'application/json' };
     
-    // 4. 直接读取你在 fetch 阶段挂载的全局账号密码变量
-    if (globalThis.USER && globalThis.PASS) {
-      fetchHeaders.Authorization = 'Basic ' + btoa(`\({globalThis.USER}:\){globalThis.PASS}`);
+    if (env && env.DOCKER_USER && env.DOCKER_PASS) {
+      // 【核心剿杀逻辑】：用 .trim() 无情清理两端所有的空格和换行符
+      const user = env.DOCKER_USER.trim();
+      const pass = env.DOCKER_PASS.trim();
+      fetchHeaders.Authorization = 'Basic ' + btoa(`\({user}:\){pass}`);
     }
 
     const res = await fetch(tokenUrl.toString(), { 
       headers: fetchHeaders 
     });
     
+    // 如果走到这里 res.ok 是 false，说明 Docker Hub 依然不认这组账号密码
     if (!res.ok) return null;
     
     const data = await res.json();
