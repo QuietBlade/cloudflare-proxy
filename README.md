@@ -55,6 +55,27 @@ docker pull nginx:alpine
 docker pull ghcr.io/immich-app/immich-server:release
 ```
 
+### （可选）配置 Docker Hub 账号：解锁私有镜像和更高额度
+不配置也能用（匿名拉公共镜像）。配置后拉取会以**你的 Docker Hub 账号身份**进行，可以拉私有镜像、避开匿名限流。
+
+1. 进入 Pages 项目 → **Settings → Variables and Secrets**，在生产环境新增两个变量：
+   - `DOCKER_USER`：Docker Hub 用户名
+   - `DOCKER_PASS`：密码或 Access Token（推荐用 Token）
+2. **重新部署一次**。Pages 的环境变量是部署时才注入的，只加变量不重新部署，线上还是读不到。
+3. 想知道到底用了哪一档凭据，再加一个变量 `DEBUG_AUTH=1` 并重新部署，然后：
+   ```bash
+   curl -sSI https://你的域名/v2/ | grep -i x-proxy-auth-source
+   # env       → 用的是 Cloudflare 上配置的账号
+   # anonymous → 这个部署没读到变量，回去检查第 1、2 步
+   # client    → 用的是客户端自带的凭据
+   ```
+   排查完把 `DEBUG_AUTH` 删掉、再部署一次即可（它只输出凭据档位，不会输出任何凭据内容）。
+
+**凭据优先级**：客户端自带的 `Authorization`（Basic/Bearer）→ Cloudflare 上的 `DOCKER_USER`/`DOCKER_PASS` → 匿名。
+客户端自己带了认证就优先用客户端的（被拒绝会自动回落到你配置的账号），没带就用你配置的账号，两者都没有就匿名拉取。
+
+> 小提示：`docker` 命令只在注册表返回 401 挑战时才会带上本机 `~/.docker/config.json` 里的凭据，所以本机已经 `docker login` 过并不代表代理一定能看到它；而 podman / containerd / oras / `curl -u` 这类会主动带凭据的客户端，其本机凭据会被优先使用。
+
 ## 🛠️ 真·5分钟搞定部署，有手就行
 ### 提前准备好这俩东西就行：
 - 一个GitHub账号（没有的去注册一个，2分钟的事）
@@ -74,7 +95,7 @@ docker pull ghcr.io/immich-app/immich-server:release
 4. 直接点「部署」，等30秒，Cloudflare就给你部署好了，就是这么简单。
 
 #### 第三步：改个配置就完事了
-编辑你Fork后的仓库里的`assets/js/config.js`文件，把里面的域名改成你刚才Cloudflare给你的`*.pages.dev`域名，或者你自己的域名：
+编辑你Fork后的仓库里的`public/assets/js/config.js`文件，把里面的域名改成你刚才Cloudflare给你的`*.pages.dev`域名，或者你自己的域名：
 ```js
 window.CF_PROXY = {
   DOMAIN: 'xxx.pages.dev', // 改成你自己的域名就行

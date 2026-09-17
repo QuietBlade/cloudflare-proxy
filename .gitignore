@@ -1,0 +1,13 @@
+# 本地开发用，可能含明文凭据，绝不提交
+.dev.vars
+.dev.vars.*
+
+# wrangler 本地状态
+.wrangler/
+.wrangler
+
+# 依赖（本项目零依赖，加个保险）
+node_modules/
+
+# 系统垃圾
+.DS_Store

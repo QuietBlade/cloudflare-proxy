@@ -155,7 +155,7 @@ Root directory:    <span class="text-brand-muted">(leave empty)</span></code>
           <dl class="text-sm text-brand-muted space-y-2 mb-4">
             <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">GitHub</dt><dd>Release 下载、Git Clone、Raw 文件、Archive 归档 — 通过 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">/https://github.com/...</code> 路径代理</dd></div>
             <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">Docker Hub</dt><dd>Registry Mirror — 通过 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">/v2/...</code> 路径代理到 registry-1.docker.io</dd></div>
-            <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">Docker Auth</dt><dd>自动解析 401 WWW-Authenticate → 获取 Bearer Token → 重试请求</dd></div>
+            <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">Docker Auth</dt><dd>自动解析 401 WWW-Authenticate → 获取 Bearer Token → 重试请求；凭据优先级：客户端自带 Authorization → <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">DOCKER_USER</code>/<code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">DOCKER_PASS</code> → 匿名</dd></div>
             <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">S3 反代</dt><dd>拦截 302/307 重定向到 AWS S3 的响应，通过 Worker 重新代理（解决中国大陆访问问题）</dd></div>
             <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">多 Registry</dt><dd>支持 GHCR、Quay.io、GCR、K8s Registry 等第三方容器镜像仓库</dd></div>
             <div class="flex gap-2"><dt class="text-brand-accent font-medium shrink-0">静态页面</dt><dd>非代理路径 → <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">env.ASSETS.fetch()</code> → 返回 Pages 托管的前端页面</dd></div>
@@ -190,7 +190,7 @@ Root directory:    <span class="text-brand-muted">(leave empty)</span></code>
         <div class="w-10 h-10 rounded-xl bg-brand-accent flex items-center justify-center shrink-0 text-slate-900 font-bold text-lg">5</div>
         <div class="flex-1 min-w-0">
           <h2 class="text-xl font-semibold mb-1">配置你的域名</h2>
-          <p class="text-brand-muted text-sm mb-4">编辑 <code class="px-1.5 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">assets/js/config.js</code>，将 DOMAIN 改为你的实际域名。页面加载时会自动替换所有代码示例中的占位域名。</p>
+          <p class="text-brand-muted text-sm mb-4">编辑 <code class="px-1.5 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">public/assets/js/config.js</code>，将 DOMAIN 改为你的实际域名。页面加载时会自动替换所有代码示例中的占位域名。</p>
           <div class="bg-[#0B1120] rounded-xl p-4 font-mono text-sm overflow-x-auto code-block relative group">
             <button class="absolute top-3 right-3 p-1.5 rounded-lg bg-brand-hover/80 hover:bg-brand-hover text-brand-muted hover:text-brand-text transition-colors duration-200 cursor-pointer opacity-0 group-hover:opacity-100 copy-btn" title="复制">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
@@ -241,6 +241,21 @@ Root directory:    <span class="text-brand-muted">(leave empty)</span></code>
         </summary>
         <div class="px-6 pb-4 text-brand-muted text-sm leading-relaxed border-t border-brand-border pt-4">
           可以。在 Worker 代码中添加 Basic Auth 校验逻辑，检查请求头中的 Authorization 字段。也可以使用 Cloudflare Access 的 Zero Trust 策略实现。
+        </div>
+      </details>
+
+      <details class="group bg-brand-card border border-brand-border rounded-xl cursor-pointer">
+        <summary class="flex items-center justify-between px-6 py-4 font-medium select-none marker:hidden">
+          怎么配置 Docker Hub 账号？为什么拉取好像没用上我配置的账号？
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="group-open:rotate-180 transition-transform duration-200"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="px-6 pb-4 text-brand-muted text-sm leading-relaxed border-t border-brand-border pt-4">
+          <ol class="list-decimal list-inside space-y-2 mb-3">
+            <li>Pages 项目 → <strong class="text-brand-text">Settings → Variables and Secrets</strong>，在生产环境新增 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">DOCKER_USER</code>（Docker Hub 用户名）和 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">DOCKER_PASS</code>（密码或 Access Token，推荐 Token）。</li>
+            <li><strong class="text-brand-text">重新部署一次</strong>。环境变量是部署时才注入的，只加变量不重新部署，线上版本照样读不到——这是「明明配了却像没配」最常见的原因。</li>
+            <li>想确认到底用了哪一档凭据：临时加一个 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">DEBUG_AUTH=1</code> 并重新部署，然后执行 <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono text-brand-accent">curl -sSI https://你的域名/v2/ | grep -i x-proxy-auth-source</code>：返回 <span class="text-brand-text">env</span> 说明用上了你配置的账号，<span class="text-brand-text">anonymous</span> 说明这个部署没读到变量（回第 1、2 步），<span class="text-brand-text">client</span> 说明用的是客户端自带的凭据。排查完删掉该变量再部署一次。</li>
+          </ol>
+          <p>凭据优先级：客户端自带 Authorization（Basic/Bearer）→ <code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">DOCKER_USER</code>/<code class="px-1 py-0.5 bg-brand-hover rounded text-xs font-mono">DOCKER_PASS</code> → 匿名。客户端凭据被上游拒绝时会自动回落到你配置的账号；诊断头只显示凭据档位，不包含任何凭据内容。</p>
         </div>
       </details>
 

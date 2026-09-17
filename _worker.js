@@ -7,6 +7,9 @@
  *   /https://... /http://...   → 通用 URL 代理（git clone / wget）
  *   /<image> 或 /<user>/<img>  → Docker pull（docker pull 本域名时）
  *   其他路径                     → Pages 静态资源
+ *
+ * Docker 鉴权凭据优先级（见「凭据处理」小节）：
+ *   客户端 Authorization(Basic/Bearer) → env.DOCKER_USER/DOCKER_PASS → 匿名
  */
 
 // ============================================================
@@ -108,80 +111,145 @@ function wrapResponse(upstream) {
 }
 
 // ============================================================
+// 凭据处理
+//
+// 注意：本文件所有 Authorization 一律用字符串拼接（'Basic ' + xxx），
+// 不要改成模板字面量。历史上这里的 ${...} 被误写成 \(...\)，
+// 导致 Basic 头变成字面量 "({user}:){pass}"，凭据永远无效。
+// ============================================================
+
+/** env 里的 Docker 账号；两者都非空才有效 */
+function getEnvCreds(env) {
+  if (!env) return null;
+  const user = (env.DOCKER_USER || '').trim();
+  const pass = (env.DOCKER_PASS || '').trim();
+  return user && pass ? { user: user, pass: pass } : null;
+}
+
+/** UTF-8 安全 base64（btoa 只接受 Latin-1，密码含中文/emoji 会直接抛错） */
+function base64Utf8(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function basicAuthHeader(user, pass) {
+  return 'Basic ' + base64Utf8(user + ':' + pass);
+}
+
+/** 客户端自带的 Authorization（Basic / Bearer），原样使用 */
+function getClientAuth(request) {
+  const raw = request.headers.get('Authorization');
+  if (!raw) return null;
+  const m = /^\s*([A-Za-z][A-Za-z0-9-]*)\s+(\S.*)$/.exec(raw);
+  if (!m) return null;
+  return { scheme: m[1].toLowerCase(), value: m[2].trim() };
+}
+
+/** 解析 WWW-Authenticate 参数，兼容带引号与不带引号两种写法 */
+function parseAuthParams(wwwAuth) {
+  const s = wwwAuth.replace(/^\s*Bearer\s+/i, '');
+  const out = {};
+  const re = /([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|([^,\s]+))/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    out[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  }
+  return out;
+}
+
+// ============================================================
 // Docker Auth Token
 // ============================================================
 
-/** 解析 WWW-Authenticate 并拿 token */
-async function fetchDockerToken(wwwAuth, env) {
-  const paramString = wwwAuth.replace(/^Bearer\s+/i, '');
-  const params = {};
-  const regex = /(\w+)="([^"]+)"/g;
-  let match;
-  while ((match = regex.exec(paramString)) !== null) {
-    params[match[1]] = match[2];
-  }
-
+/**
+ * 用凭据换 token。
+ * 依次尝试：客户端 Basic 凭据 → env 凭据 → 匿名，任一步成功即返回。
+ * 客户端带的是 Bearer 时无法用它换新 token（token 不是可再生的），直接落到 env。
+ *
+ * @returns {Promise<{token: string, source: 'client'|'env'|'anonymous'} | null>}
+ */
+async function fetchDockerToken(wwwAuth, env, clientAuth) {
+  const params = parseAuthParams(wwwAuth);
   if (!params.realm) return null;
 
+  let tokenUrl;
   try {
-    const tokenUrl = new URL(params.realm);
+    tokenUrl = new URL(params.realm);
     if (params.service) tokenUrl.searchParams.set('service', params.service);
     if (params.scope) tokenUrl.searchParams.set('scope', params.scope);
-    
     // 增加 client_id，伪装成标准客户端，防止被官方拦截
     tokenUrl.searchParams.set('client_id', 'cloudflare-docker-proxy');
-
-    const fetchHeaders = { Accept: 'application/json' };
-    
-    if (env && env.DOCKER_USER && env.DOCKER_PASS) {
-      // 【核心剿杀逻辑】：用 .trim() 无情清理两端所有的空格和换行符
-      const user = env.DOCKER_USER.trim();
-      const pass = env.DOCKER_PASS.trim();
-      fetchHeaders.Authorization = 'Basic ' + btoa(`\({user}:\){pass}`);
-    }
-
-    const res = await fetch(tokenUrl.toString(), { 
-      headers: fetchHeaders 
-    });
-    
-    // 如果走到这里 res.ok 是 false，说明 Docker Hub 依然不认这组账号密码
-    if (!res.ok) return null;
-    
-    const data = await res.json();
-    return data.token || data.access_token || null;
   } catch (err) {
     return null;
   }
+
+  // 组装尝试顺序：客户端凭据优先，env 兜底，最后匿名
+  const attempts = [];
+  if (clientAuth && clientAuth.scheme === 'basic') {
+    attempts.push({ source: 'client', header: 'Basic ' + clientAuth.value });
+  }
+  const creds = getEnvCreds(env);
+  if (creds) {
+    attempts.push({ source: 'env', header: basicAuthHeader(creds.user, creds.pass) });
+  }
+  // 客户端凭据与 env 相同时不重复请求
+  const unique = attempts.filter((a, i) => attempts.findIndex((b) => b.header === a.header) === i);
+  unique.push({ source: 'anonymous', header: null });
+
+  for (const attempt of unique) {
+    try {
+      const fetchHeaders = { Accept: 'application/json' };
+      if (attempt.header) fetchHeaders.Authorization = attempt.header;
+
+      const res = await fetch(tokenUrl.toString(), { headers: fetchHeaders });
+      // res.ok 为 false 说明这一档凭据不被认可，继续尝试下一档
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      const token = data.token || data.access_token;
+      if (token) return { token: token, source: attempt.source };
+    } catch (err) {
+      // 网络/解析异常同样降级到下一档
+    }
+  }
+  return null;
 }
 
 // ============================================================
 // 核心代理（带 token 重试 + S3 重定向反代）
 // ============================================================
 
-async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
+/**
+ * @param {object} [diag] 诊断对象，会被写入 { source } 表示本次用了哪一档凭据
+ */
+async function proxyWithAuth(targetUrl, request, isDocker, env, redirectCount = 0, diag) {
   if (redirectCount > MAX_REDIRECTS) {
     return new Response('Too many redirects', { status: 508 });
   }
 
   const headers = buildReqHeaders(request, targetUrl);
+  // 客户端主动带了认证就先原样透传；只有上游 401 时 Worker 才去换 token
+  const clientAuth = isDocker ? getClientAuth(request) : null;
+  if (clientAuth && diag && !diag.source) diag.source = 'client';
 
-  // 修改点：使用 let 声明，允许被重试的请求覆盖
   let upstream = await fetch(targetUrl, {
     method: request.method,
     headers,
     body: request.body,
-    redirect: 'manual', 
+    redirect: 'manual',
   });
 
-  // ===== Docker 401 → 拿 token 重试 =====
+  // ===== Docker 401 → 换 token 重试 =====
   if (isDocker && upstream.status === 401) {
     const wwwAuth = upstream.headers.get('WWW-Authenticate');
     if (wwwAuth) {
-      const token = await fetchDockerToken(wwwAuth);
-      if (token) {
+      const got = await fetchDockerToken(wwwAuth, env, clientAuth);
+      if (got) {
+        if (diag) diag.source = got.source;
         const authHeaders = buildReqHeaders(request, targetUrl);
-        authHeaders.set('Authorization', `Bearer ${token}`);
-        // 修改点：不直接 return，而是覆盖 upstream，让其继续往下走
+        authHeaders.set('Authorization', 'Bearer ' + got.token);
         upstream = await fetch(targetUrl, {
           method: request.method,
           headers: authHeaders,
@@ -189,7 +257,9 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
           redirect: 'manual',
         });
       } else {
-        // 修改点：如果拿不到 token（或解析失败），抹除 WWW-Authenticate，防止客户端直连被墙
+        // 拿不到 token（解析失败或凭据全都不认）：抹除 WWW-Authenticate，
+        // 防止客户端被迫直连可能被墙的 auth 服务
+        if (diag) diag.source = 'none';
         const res = wrapResponse(upstream);
         res.headers.delete('WWW-Authenticate');
         return res;
@@ -198,21 +268,29 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
   }
 
   // ===== S3 / CDN 重定向 → 重新代理 =====
-  // 修改点：此时的 upstream 可能是第一次的 307，也可能是获取 Token 重试后拿到的 307
+  // 此时的 upstream 可能是第一次的 307，也可能是换 token 重试后拿到的 307
   if (upstream.status === 302 || upstream.status === 307) {
     const location = upstream.headers.get('Location');
     if (location) {
-      const redirHeaders = buildReqHeaders(request, location);
-      const upstreamAuth = upstream.headers.get('Authorization');
-      if (upstreamAuth) redirHeaders.set('Authorization', upstreamAuth);
+      let redirectHost = '';
+      try { redirectHost = new URL(location).hostname; } catch { redirectHost = ''; }
 
-      // 修改点：直接递归调用 proxyWithAuth 自己，而不是单独写一套 fetch
-      // 注意：重定向到 S3 后，不再视为 Docker 鉴权 (isDocker = false)
+      const redirHeaders = buildReqHeaders(request, location);
+      if (DOCKER_REGISTRIES.has(redirectHost)) {
+        const upstreamAuth = upstream.headers.get('Authorization');
+        if (upstreamAuth) redirHeaders.set('Authorization', upstreamAuth);
+      } else {
+        // 关键：客户端凭据只发给 registry。S3/CDN 的预签名 URL 自身带签名，
+        // 再附带 Authorization 会被拒（Only one auth mechanism allowed）
+        redirHeaders.delete('Authorization');
+      }
+
+      // 重定向到存储节点后不再视为 Docker 鉴权
       return proxyWithAuth(location, new Request(location, {
         method: request.method,
         headers: redirHeaders,
-        body: request.body
-      }), false, redirectCount + 1);
+        body: request.body,
+      }), false, env, redirectCount + 1, diag);
     }
   }
 
@@ -230,24 +308,27 @@ async function proxyWithAuth(targetUrl, request, isDocker, redirectCount = 0) {
  * 不做"单段 = library/xxx"的猜测，避免把 /gh、/docs 等静态页面路径误判为镜像名。
  */
 function parseDockerPath(pathname, search) {
-  // 核心修改：处理 /v2/ghcr.io/xxx 格式
+  const suffix = search || '';
+
+  // 处理 /v2/ghcr.io/xxx 格式
   if (pathname.startsWith('/v2/')) {
     const pathWithoutV2 = pathname.replace('/v2/', '');
     const parts = pathWithoutV2.split('/');
-    
+
     // 如果发现路径第一段是第三方 registry（比如 ghcr.io）
     if (DOCKER_REGISTRIES.has(parts[0])) {
       const host = parts[0];
       const imagePath = parts.slice(1).join('/');
+      // 一律字符串拼接，别用模板字面量（历史踩坑见「凭据处理」说明）
       return {
-        targetUrl: `https://\({host}/v2/\){imagePath}${search || ''}`,
+        targetUrl: 'https://' + host + '/v2/' + imagePath + suffix,
         isDocker: true,
       };
     }
-    
+
     // 否则默认发往 Docker Hub
     return {
-      targetUrl: DOCKER_UPSTREAM + pathname + (search || ''),
+      targetUrl: DOCKER_UPSTREAM + pathname + suffix,
       isDocker: true,
     };
   }
@@ -258,7 +339,7 @@ function parseDockerPath(pathname, search) {
     const host = parts[0];
     const imagePath = parts.slice(1).join('/');
     return {
-      targetUrl: `https://\({host}/v2/\){imagePath}${search || ''}`,
+      targetUrl: 'https://' + host + '/v2/' + imagePath + suffix,
       isDocker: true,
     };
   }
@@ -274,15 +355,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname, search } = url;
-    globalThis.USER = env.DOCKER_USER;
-    globalThis.PASS = env.DOCKER_PASS;
 
     if (request.method === 'OPTIONS') return corsPreflight();
 
     // —— Docker 路径 ——
     const docker = parseDockerPath(pathname, search);
     if (docker) {
-      return proxyWithAuth(docker.targetUrl, request, docker.isDocker);
+      const diag = { source: null };
+      const res = await proxyWithAuth(docker.targetUrl, request, docker.isDocker, env, 0, diag);
+
+      // 诊断：只暴露「用了哪一档凭据」，不含任何凭据内容
+      const source = diag.source || 'none';
+      console.log('docker-proxy ' + request.method + ' ' + pathname + ' auth=' + source);
+      if (env.DEBUG_AUTH === '1') {
+        try { res.headers.set('X-Proxy-Auth-Source', source); } catch (err) { /* 响应头不可写就算了 */ }
+      }
+      return res;
     }
 
     // —— 通用 URL 代理 (/https://github.com/...) ——
@@ -292,12 +380,12 @@ export default {
       try {
         const targetHost = new URL(targetUrl).hostname;
         if (!ALLOWED_HOSTS.includes(targetHost)) {
-          return new Response(`Error: domain "${targetHost}" not allowed.\n`, { status: 400 });
+          return new Response('Error: domain "' + targetHost + '" not allowed.\n', { status: 400 });
         }
-      } catch {
+      } catch (err) {
         return new Response('Error: invalid target URL.\n', { status: 400 });
       }
-      return proxyWithAuth(targetUrl, request, false);
+      return proxyWithAuth(targetUrl, request, false, env);
     }
 
     // —— 静态资源 ——
