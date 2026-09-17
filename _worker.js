@@ -44,12 +44,23 @@ const STRIP_RES_HEADERS = new Set([
 const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const MAX_REDIRECTS = 5;
 
+// 大文件断点续传（Docker Hub 的 blob CDN 回源偶发静默断流）
+const BLOB_IDLE_MS = 15000;       // 上游静默多久判定断流
+const BLOB_MAX_RESUMES = 6;       // 单个响应最多续传几次
+const BLOB_MIN_SIZE = 262144;     // 小于 256KB 的响应不折腾续传
+
 // ============================================================
 // 工具函数
 // ============================================================
 
 function isAmazonS3(url) {
   try { return new URL(url).hostname.includes('amazonaws.com'); } catch { return false; }
+}
+
+/** 正整数解析，带兜底（用于从 env 读可调参数） */
+function toInt(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 function getAmzDate() {
@@ -222,9 +233,99 @@ async function fetchDockerToken(wwwAuth, env, clientAuth) {
 // ============================================================
 
 /**
- * @param {object} [diag] 诊断对象，会被写入 { source } 表示本次用了哪一档凭据
+ * 把可能中途断流的上游响应包装成「会自动断点续传」的流。
+ *
+ * 背景：Docker Hub 的 blob 由 CDN 提供，Worker 回源时偶发「传了约 1MB 就静默不动」，
+ * 客户端会一直卡在进度条上 5 分钟也不报错。这里检测到「上游静默超时」或
+ * 「提前结束但字节数不够」，就用 Range 从断点续传，最多 BLOB_MAX_RESUMES 次；
+ * 上游若忽略 Range 返回 200，则重下并丢弃已经发给客户端的前缀，保证字节不错位。
+ * 全部失败时主动 abort 流，让 docker 立刻重试该层，而不是永久挂住。
  */
-async function proxyWithAuth(targetUrl, request, isDocker, env, redirectCount = 0, diag) {
+function streamWithResume(initial, ctx) {
+  const rawTotal = initial.headers.get('content-length');
+  const total = rawTotal ? parseInt(rawTotal, 10) : null;
+  const encoding = (initial.headers.get('content-encoding') || 'identity').toLowerCase();
+  const ranges = (initial.headers.get('accept-ranges') || '').toLowerCase();
+  // 有压缩编码时字节数对不上、上游明确不支持 Range 时不折腾
+  if (encoding !== 'identity' || ranges === 'none') return initial;
+
+  let sent = 0;      // 已经写给客户端的字节数（= 续传起点）
+  let resumes = 0;
+  const idleMs = ctx.idleMs || BLOB_IDLE_MS;
+  const maxResumes = ctx.maxResumes || BLOB_MAX_RESUMES;
+
+  const { readable, writable } = new TransformStream();
+  (async () => {
+    const writer = writable.getWriter();
+    let current = initial;
+    let skip = 0;    // 当前响应里需要丢弃的前缀字节（上游忽略 Range 返回 200 时）
+    try {
+      for (;;) {
+        const reader = current.body.getReader();
+        let interrupted = false;
+        try {
+          for (;;) {
+            let chunk;
+            // 静默计时只包住「读上游」这一段：客户端背压不算上游断流
+            const idle = setTimeout(() => { interrupted = true; reader.cancel().catch(() => {}); }, idleMs);
+            try { chunk = await reader.read(); } finally { clearTimeout(idle); }
+            if (chunk.done) break;
+
+            let buf = chunk.value;
+            if (skip > 0) {
+              if (buf.length <= skip) { skip -= buf.length; continue; }
+              buf = buf.subarray(skip);
+              skip = 0;
+            }
+            if (buf.length) {
+              await writer.write(buf);
+              sent += buf.length;
+            }
+          }
+        } catch (err) {
+          interrupted = true;
+        }
+
+        // 正常读完（或本来就没有 content-length 且流干净结束）才算完成
+        if (!interrupted && (total === null || sent >= total)) break;
+        if (++resumes > maxResumes) {
+          throw new Error('blob resume exhausted at ' + sent + (total ? '/' + total : ''));
+        }
+
+        const headers = new Headers(ctx.headers);
+        headers.set('Range', 'bytes=' + sent + '-');
+        const again = await fetch(ctx.url, { method: 'GET', headers, redirect: 'manual' });
+        if (again.status === 206) {
+          current = again;
+          continue;
+        }
+        if (again.status === 200) {
+          // 上游不支持 Range：整份重下，跳过已发送的部分
+          current = again;
+          skip = sent;
+          continue;
+        }
+        throw new Error('blob resume got HTTP ' + again.status);
+      }
+      await writer.close();
+    } catch (err) {
+      // 让客户端立刻感知失败并重试该层，而不是无限等待
+      try { await writer.abort(err); } catch (_) { /* 客户端已经断开 */ }
+    }
+  })();
+
+  return new Response(readable, {
+    status: initial.status,
+    statusText: initial.statusText,
+    headers: initial.headers,
+  });
+}
+
+/**
+ * @param {object} [diag] 诊断对象，会被写入 { source } 表示本次用了哪一档凭据
+ * @param {object} [resumeCtx] 最后一次重定向的目标（大文件从这里断点续传）
+ */
+async function proxyWithAuth(targetUrl, request, isDocker, env, redirectCount = 0, diag, resumeCtx) {
   if (redirectCount > MAX_REDIRECTS) {
     return new Response('Too many redirects', { status: 508 });
   }
@@ -285,13 +386,30 @@ async function proxyWithAuth(targetUrl, request, isDocker, env, redirectCount = 
         redirHeaders.delete('Authorization');
       }
 
-      // 重定向到存储节点后不再视为 Docker 鉴权
+      // 重定向到存储节点后不再视为 Docker 鉴权。
+      // GET 大文件带上续传上下文：最后一跳中途断流时自动 Range 续传
+      const resumeCtx = (request.method === 'GET' && !(env && env.BLOB_RESUME === '0'))
+        ? {
+            url: location,
+            headers: redirHeaders,
+            idleMs: toInt(env && env.BLOB_IDLE_MS, BLOB_IDLE_MS),
+            maxResumes: toInt(env && env.BLOB_MAX_RESUMES, BLOB_MAX_RESUMES),
+          }
+        : null;
+
       return proxyWithAuth(location, new Request(location, {
         method: request.method,
         headers: redirHeaders,
         body: request.body,
-      }), false, env, redirectCount + 1, diag);
+      }), false, env, redirectCount + 1, diag, resumeCtx);
     }
+  }
+
+  // 最后一跳是 200：大响应包一层自动断点续传
+  if (resumeCtx && upstream.status === 200 && upstream.body) {
+    const len = parseInt(upstream.headers.get('content-length') || '0', 10) || 0;
+    const tiny = len > 0 && len < BLOB_MIN_SIZE;
+    if (!tiny) return wrapResponse(streamWithResume(upstream, resumeCtx));
   }
 
   return wrapResponse(upstream);
